@@ -475,6 +475,34 @@ class GymTrackerSettingTab extends PluginSettingTab {
         // Stop click on input from toggling collapse
         nameInput.onclick = (ev: MouseEvent) => ev.stopPropagation();
 
+        // Duplicate template
+        const copyBtn = header.createEl("button", {
+            text: "📋",
+            cls: "gym-template-copy-btn",
+            attr: { title: "Duplicate template" },
+        });
+
+        copyBtn.onclick = async (ev: MouseEvent) => {
+            ev.stopPropagation();
+
+            // Persist any pending edits before cloning the source template.
+            await this.flushSave(tpl);
+
+            const copy: WorkoutTemplate = {
+                ...tpl,
+                id: this.plugin.store.generateId(),
+                name: `${tpl.name} (Copy)`,
+                exercises: tpl.exercises.map(ex => ({
+                    ...ex,
+                    id: this.plugin.store.generateId(),
+                    sets: ex.sets.map(set => ({ ...set })),
+                })),
+            };
+
+            await this.plugin.store.saveTemplate(copy);
+            this.refreshTab();
+        };
+
         const delBtn = header.createEl("button", {
             text: "🗑️",
             cls: "gym-template-delete-btn",
