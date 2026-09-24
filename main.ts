@@ -120,8 +120,13 @@ class GymTrackerSettingTab extends PluginSettingTab {
         this.plugin = plugin;
     }
 
+    /** Re-render the settings tab while preserving scroll position.
+     *  display() rebuilds the entire panel from scratch, which would
+     *  otherwise reset scroll to the top on every single edit. */
     refreshTab(): void {
+        const scrollTop = this.containerEl.scrollTop;
         this.display();
+        this.containerEl.scrollTop = scrollTop;
     }
 
     /** Schedule a debounced template save. Every call resets the timer. */
