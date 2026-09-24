@@ -7,8 +7,16 @@ import { WorkoutTemplate, TemplateExercise } from "./types";
 import { searchExercises } from "./data/exerciseDataset";
 import { todayStr } from "./utils/calendar";
 
+// How often to poll the templates/sessions files for external changes (e.g.
+// synchronized in by Syncthing/Obsidian Sync from another device). Vault
+// "modify" events are also used for faster reaction, but are not guaranteed
+// to fire reliably for every platform/sync tool, so polling is a fallback.
+const EXTERNAL_CHANGE_POLL_INTERVAL_MS = 5000;
+
 export default class GymTrackerPlugin extends Plugin {
     store!: DataStore;
+    private settingTab!: GymTrackerSettingTab;
+    private isCheckingExternalChanges = false;
 
     async onload(): Promise<void> {
         this.store = new DataStore(this);
@@ -53,7 +61,31 @@ export default class GymTrackerPlugin extends Plugin {
         });
 
         // Settings tab
-        this.addSettingTab(new GymTrackerSettingTab(this.app, this));
+        this.settingTab = new GymTrackerSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
+
+        // React to externally modified templates/sessions files (e.g.
+        // synchronized in via Syncthing/Obsidian Sync from another device)
+        // so open views update without requiring the plugin to be disabled
+        // and re-enabled.
+        this.registerEvent(
+            this.app.vault.on("modify", (file) => {
+                const templatesPath = this.store.getTemplatesVaultPath();
+                const mainPath = this.store.getVaultPath();
+                if (file.path === templatesPath || file.path === mainPath) {
+                    void this.checkForExternalChanges();
+                }
+            })
+        );
+
+        // Filesystem watchers don't reliably fire for every platform/sync
+        // tool combination (e.g. hidden folders, some sync clients), so also
+        // poll periodically as a safety net.
+        this.registerInterval(
+            window.setInterval(() => {
+                void this.checkForExternalChanges();
+            }, EXTERNAL_CHANGE_POLL_INTERVAL_MS)
+        );
     }
 
     onunload(): void {
@@ -100,6 +132,62 @@ export default class GymTrackerPlugin extends Plugin {
         });
         await workspace.revealLeaf(leaf);
     }
+
+    // ── External change detection ──
+
+    /**
+     * Checks whether the templates/sessions files were modified outside of
+     * this DataStore instance (e.g. synchronized in from another device) and
+     * refreshes whichever views correspond to what changed. Guards against
+     * overlapping runs since this can be triggered by both the vault
+     * "modify" event and the periodic poll.
+     */
+    private async checkForExternalChanges(): Promise<void> {
+        if (this.isCheckingExternalChanges) {
+            return;
+        }
+        this.isCheckingExternalChanges = true;
+
+        try {
+            const { templatesChanged, sessionsChanged } =
+                await this.store.checkForExternalChanges();
+
+            if (templatesChanged) {
+                this.refreshTemplateViews();
+            }
+            if (sessionsChanged) {
+                this.refreshCalendarAndWorkoutViews();
+            }
+        } catch (err) {
+            console.error("Gym Tracker: failed to check for external changes:", err);
+        } finally {
+            this.isCheckingExternalChanges = false;
+        }
+    }
+
+    private refreshTemplateViews(): void {
+        if (this.settingTab) {
+            this.settingTab.refreshTab();
+        }
+    }
+
+    private refreshCalendarAndWorkoutViews(): void {
+        const { workspace } = this.app;
+
+        for (const leaf of workspace.getLeavesOfType(CALENDAR_VIEW_TYPE)) {
+            const view = leaf.view as CalendarView;
+            view.refresh();
+        }
+
+        // WorkoutView isn't imported with its internals here, so refresh it
+        // defensively: only call refresh() if the view actually exposes it.
+        for (const leaf of workspace.getLeavesOfType(WORKOUT_VIEW_TYPE)) {
+            const view = leaf.view as unknown as { refresh?: () => void };
+            if (typeof view.refresh === "function") {
+                view.refresh();
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════
@@ -107,7 +195,6 @@ export default class GymTrackerPlugin extends Plugin {
 // ═══════════════════════════════════════════════════
 
 let activeDragId: string | null = null;
-
 
 class GymTrackerSettingTab extends PluginSettingTab {
     plugin: GymTrackerPlugin;
@@ -196,8 +283,6 @@ class GymTrackerSettingTab extends PluginSettingTab {
                     });
                 },
             },
-
-
 
             // Vault folder
             {

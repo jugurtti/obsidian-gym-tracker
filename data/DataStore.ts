@@ -21,11 +21,22 @@ const DEFAULT_DATA: GymTrackerData = {
 /**
  * Data access layer supporting two storage backends:
  * - 'plugin': Obsidian's loadData/saveData (.obsidian/plugins/.../data.json)
- * - 'vault': Regular vault file (synced via Obsidian Sync / iCloud)
+ * - 'vault': Regular vault file (synced via Obsidian Sync / iCloud / Syncthing)
+ *
+ * Templates and sessions are persisted to two separate files so that editing
+ * one does not need to rewrite the other. This keeps concurrent edits from
+ * different synchronized devices (e.g. logging a workout on mobile while
+ * editing templates on desktop) from unnecessarily touching the same file.
  */
 export class DataStore {
     private plugin: Plugin;
     private data: GymTrackerData;
+
+    // Tracks the exact file contents we last wrote/read for each storage
+    // file. Used to detect externally modified files (e.g. synchronized via
+    // Syncthing) without reacting to our own writes.
+    private lastTemplatesContent: string | null = null;
+    private lastSessionsContent: string | null = null;
 
     constructor(plugin: Plugin) {
         this.plugin = plugin;
@@ -41,15 +52,17 @@ export class DataStore {
         const path = this.getVaultPath(bootSettings);
         if (await this.plugin.app.vault.adapter.exists(path)) {
             const text = await this.plugin.app.vault.adapter.read(path);
+            this.lastSessionsContent = text;
             raw = this.parseFile(text, path) ?? undefined;
             if (raw && raw.settings) {
                 Object.assign(bootSettings, this.buildSettings(raw.settings));
             }
         }
-        
+
         const templatesPath = this.getTemplatesVaultPath(bootSettings);
         if (await this.plugin.app.vault.adapter.exists(templatesPath)) {
             const text = await this.plugin.app.vault.adapter.read(templatesPath);
+            this.lastTemplatesContent = text;
             const tRaw = this.parseFile(text, templatesPath);
             if (tRaw && tRaw.templates) {
                 templatesFromSeparateFile = tRaw.templates;
@@ -89,8 +102,11 @@ export class DataStore {
         return s;
     }
 
+    /** Persist both templates and sessions. Used when both may have changed
+     * (e.g. settings changes that convert weight units, or clearing all data). */
     async save(): Promise<void> {
-        await this.writeStorage(this.data);
+        await this.writeTemplatesFile();
+        await this.writeSessionsFile();
     }
 
     // ── Storage backend ──
@@ -131,43 +147,115 @@ export class DataStore {
         return json;
     }
 
-    private async writeStorage(data: GymTrackerData): Promise<void> {
+    private async ensureFolder(path: string): Promise<void> {
+        const vault = this.plugin.app.vault;
+        const dir = path.split('/').slice(0, -1).join('/');
+
+        if (!dir) {
+            return;
+        }
+
+        const parts = dir.split('/');
+        let current = '';
+        for (const part of parts) {
+            current = current ? `${current}/${part}` : part;
+            if (!(await vault.adapter.exists(current))) {
+                await vault.adapter.mkdir(current);
+            }
+        }
+    }
+
+    /** Write only the templates file. Does not touch the sessions file. */
+    private async writeTemplatesFile(): Promise<void> {
         try {
             const vault = this.plugin.app.vault;
-            const path = this.getVaultPath(data.settings);
-            const dir = path.split('/').slice(0, -1).join('/');
+            const templatesPath = this.getTemplatesVaultPath();
+            await this.ensureFolder(templatesPath);
 
-            // Ensure folder hierarchy exists
-            if (dir) {
-                const parts = dir.split('/');
-                let current = '';
-                for (const part of parts) {
-                    current = current ? `${current}/${part}` : part;
-                    if (!(await vault.adapter.exists(current))) {
-                        await vault.adapter.mkdir(current);
-                    }
-                }
-            }
+            const templatesData: GymTrackerData = { ...this.data, sessions: {} };
+            const content = this.buildFile(templatesData);
 
-            // Write templates to separate file
-            const templatesPath = this.getTemplatesVaultPath(data.settings);
-            const templatesData = { ...data, sessions: {} };
-            const templatesContent = this.buildFile(templatesData);
-            await vault.adapter.write(templatesPath, templatesContent);
-
-            // Write main data file (without templates)
-            const mainData = { ...data, templates: [] };
-            const mainContent = this.buildFile(mainData);
-            await vault.adapter.write(path, mainContent);
+            await vault.adapter.write(templatesPath, content);
+            this.lastTemplatesContent = content;
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            console.error('Gym Tracker: vault write failed:', err);
+            console.error('Gym Tracker: vault write failed (templates):', err);
+            new Notice(`Gym Workout Tracker: Failed to save templates. ${message}`, 8000);
+        }
+    }
+
+    /** Write only the sessions/data file. Does not touch the templates file. */
+    private async writeSessionsFile(): Promise<void> {
+        try {
+            const vault = this.plugin.app.vault;
+            const path = this.getVaultPath();
+            await this.ensureFolder(path);
+
+            const mainData: GymTrackerData = { ...this.data, templates: [] };
+            const content = this.buildFile(mainData);
+
+            await vault.adapter.write(path, content);
+            this.lastSessionsContent = content;
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error('Gym Tracker: vault write failed (sessions):', err);
             new Notice(`Gym Workout Tracker: Failed to save data. ${message}`, 8000);
         }
     }
 
     getData(): GymTrackerData {
         return this.data;
+    }
+
+    // ── External change detection ──
+
+    /**
+     * Checks the templates and sessions files on disk for changes that were
+     * not made by this DataStore instance (e.g. synchronized in from another
+     * device via Syncthing/Obsidian Sync). Updates in-memory state for
+     * whichever file(s) changed and reports which ones changed so the caller
+     * can refresh the relevant views.
+     */
+    async checkForExternalChanges(): Promise<{ templatesChanged: boolean; sessionsChanged: boolean }> {
+        const vault = this.plugin.app.vault;
+        let templatesChanged = false;
+        let sessionsChanged = false;
+
+        const templatesPath = this.getTemplatesVaultPath();
+        if (await vault.adapter.exists(templatesPath)) {
+            const text = await vault.adapter.read(templatesPath);
+            if (text !== this.lastTemplatesContent) {
+                const parsed = this.parseFile(text, templatesPath);
+                if (parsed && parsed.templates) {
+                    this.data.templates = parsed.templates;
+                    templatesChanged = true;
+                }
+                this.lastTemplatesContent = text;
+            }
+        }
+
+        const mainPath = this.getVaultPath();
+        if (await vault.adapter.exists(mainPath)) {
+            const text = await vault.adapter.read(mainPath);
+            if (text !== this.lastSessionsContent) {
+                const parsed = this.parseFile(text, mainPath);
+                if (parsed) {
+                    if (parsed.sessions) {
+                        this.data.sessions = { ...parsed.sessions };
+                        sessionsChanged = true;
+                    }
+                    // Settings live in both files; pick up changes made
+                    // elsewhere (e.g. unit changes) without clobbering
+                    // templates/sessions already held in memory.
+                    if (parsed.settings) {
+                        this.data.settings = this.buildSettings(parsed.settings);
+                    }
+                }
+                this.lastSessionsContent = text;
+            }
+        }
+
+        return { templatesChanged, sessionsChanged };
     }
 
     // ── Template CRUD ──
@@ -187,12 +275,12 @@ export class DataStore {
         } else {
             this.data.templates.push(template);
         }
-        await this.save();
+        await this.writeTemplatesFile();
     }
 
     async deleteTemplate(id: string): Promise<void> {
         this.data.templates = this.data.templates.filter(t => t.id !== id);
-        await this.save();
+        await this.writeTemplatesFile();
     }
 
     // ── Session CRUD ──
@@ -209,12 +297,12 @@ export class DataStore {
 
     async saveSession(session: WorkoutSession): Promise<void> {
         this.data.sessions[session.date] = session;
-        await this.save();
+        await this.writeSessionsFile();
     }
 
     async deleteSession(date: string): Promise<void> {
         delete this.data.sessions[date];
-        await this.save();
+        await this.writeSessionsFile();
     }
 
     // ── "Last time" queries ──
@@ -297,6 +385,8 @@ export class DataStore {
         }
 
         this.data.settings = settings;
+        // Settings are embedded in both files, and a unit change updates
+        // weights in both templates and sessions, so persist both.
         await this.save();
     }
 
