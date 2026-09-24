@@ -4,9 +4,11 @@ import { confirmAction } from "../utils/ConfirmModal";
 import {
     WorkoutTemplate,
     TemplateExercise,
+    TemplateSet,
     WorkoutSession,
     SessionExercise,
     SessionSet,
+    WorkoutColumnId,
 } from "../types";
 import { CALENDAR_VIEW_TYPE, CalendarView } from "./CalendarView";
 
@@ -24,6 +26,7 @@ export class WorkoutView extends ItemView {
     // exerciseId → (setNumber → { reps, weight })
     private todayData: Map<string, Map<number, { reps: number; weight: number }>> = new Map();
     private isDeleted: boolean = false;
+
     private saveTimeout: number | null = null;
     private saveChain: Promise<void> = Promise.resolve();
 
@@ -54,10 +57,12 @@ export class WorkoutView extends ItemView {
 
     async setState(state: Record<string, unknown>, result: ViewStateResult): Promise<void> {
         const newDate = (state.date as string) ?? "";
+
         // Save current session before switching to a different date
         if (newDate !== this.date && this.date) {
             await this.flushSave();
         }
+
         this.date = newDate;
         result.history = false;
         await this.render();
@@ -111,6 +116,7 @@ export class WorkoutView extends ItemView {
 
     private renderTemplatePicker(container: HTMLElement): void {
         const templates = this.store.getTemplates();
+
         if (templates.length === 0) {
             container.createEl("p", {
                 text: "No templates yet. Create one in Settings → Gym Workout Tracker.",
@@ -120,11 +126,10 @@ export class WorkoutView extends ItemView {
         }
 
         const pickerDiv = container.createDiv("gym-template-picker");
-
         pickerDiv.createEl("label", { text: "Select template:" });
+
         const select = pickerDiv.createEl("select");
         select.createEl("option", { text: "-- choose --", value: "" });
-
         for (const tpl of templates) {
             select.createEl("option", { text: tpl.name, value: tpl.id });
         }
@@ -133,18 +138,21 @@ export class WorkoutView extends ItemView {
             text: "Load Template",
             cls: "gym-load-template-btn",
         });
-
         loadBtn.onclick = async () => {
             const id = select.value;
             if (!id) return;
+
             const tpl = this.store.getTemplate(id);
             if (tpl) {
                 this.template = tpl;
                 this.sessionId = this.store.generateId();
+
                 // Initialize today data from template defaults + last time
                 this.initTodayData(tpl);
+
                 // Auto-save initial draft
                 await this.autoSave();
+
                 container.empty();
                 this.renderForm(container);
             }
@@ -155,6 +163,7 @@ export class WorkoutView extends ItemView {
 
     private loadExistingSession(session: WorkoutSession): void {
         this.sessionId = session.id;
+
         const tpl = this.store.getTemplate(session.templateId);
         if (tpl) {
             this.template = tpl;
@@ -176,6 +185,7 @@ export class WorkoutView extends ItemView {
                 })),
             };
         }
+
         this.sessionNote = session.note || "";
 
         for (const ex of session.exercises) {
@@ -184,6 +194,7 @@ export class WorkoutView extends ItemView {
                 setMap.set(set.setNumber, { reps: set.reps, weight: set.weight });
             }
             this.todayData.set(ex.templateExerciseId, setMap);
+
             if (ex.note) {
                 this.exerciseNotes.set(ex.templateExerciseId, ex.note);
             }
@@ -244,7 +255,6 @@ export class WorkoutView extends ItemView {
 
         // Buttons
         const btnDiv = container.createDiv("gym-save-btn-row");
-
         const closeBtn = btnDiv.createEl("button", {
             text: "✅ Done",
             cls: "gym-save-btn",
@@ -265,18 +275,21 @@ export class WorkoutView extends ItemView {
                 if (await confirmAction(this.app, "Delete this workout? This cannot be undone.")) {
                     this.isDeleted = true;
                     await this.store.deleteSession(this.date);
+
                     const calLeaves = this.app.workspace.getLeavesOfType(CALENDAR_VIEW_TYPE);
                     for (const leaf of calLeaves) {
                         (leaf.view as CalendarView).refresh();
                     }
+
                     this.leaf.detach();
                 }
             };
         }
     }
 
-    // ── Render one exercise's 7-column table ──
-
+    // ── Render one exercise's set table ──
+    // Column order (all except "Set") is user-configurable via Settings →
+    // Gym Workout Tracker → Workout Table Columns.
     private renderExerciseTable(container: HTMLElement, tplEx: TemplateExercise): void {
         const exDiv = container.createDiv("gym-exercise-block");
 
@@ -320,17 +333,30 @@ export class WorkoutView extends ItemView {
         this.renderTableBody(table, tplEx);
     }
 
+    /** Human-readable header label for a given column id. "Kg"/"Lbs"
+     *  substitutes the user's current weight unit. */
+    private columnLabel(colId: WorkoutColumnId, weightUnit: string): string {
+        switch (colId) {
+            case 'reps': return "Reps";
+            case 'kg': return weightUnit;
+            case 'reps_last': return "Reps (last)";
+            case 'kg_last': return `${weightUnit} (last)`;
+            case 'reps_tpl': return "Reps (tpl)";
+            case 'kg_tpl': return `${weightUnit} (tpl)`;
+            case 'rest': return "Rest";
+        }
+    }
+
     private renderTableHeader(table: HTMLElement): void {
         const thead = table.createEl("thead");
         const tr = thead.createEl("tr");
+
         const w = this.store.getSettings().weightUnit === 'lbs' ? 'Lbs' : 'Kg';
-        const headers = [
-            "Set", "Reps (tpl)", "Reps (last)", "Reps",
-            `${w} (tpl)`, `${w} (last)`, w,
-            "Rest",
-        ];
-        for (const h of headers) {
-            tr.createEl("th", { text: h });
+        const order = this.store.getSettings().columnOrder;
+
+        tr.createEl("th", { text: "Set" });
+        for (const colId of order) {
+            tr.createEl("th", { text: this.columnLabel(colId, w) });
         }
     }
 
@@ -338,75 +364,99 @@ export class WorkoutView extends ItemView {
         const tbody = table.createEl("tbody");
         const setMap = this.todayData.get(tplEx.id) || new Map<number, { reps: number; weight: number }>();
         const lastData = this.store.getLastSetDataForExercise(tplEx.id, this.date);
+        const order = this.store.getSettings().columnOrder;
 
         for (const tSet of tplEx.sets) {
             const tr = tbody.createEl("tr");
             const sn = tSet.setNumber;
+
             const last: { reps: number; weight: number } | undefined = lastData.get(sn);
             const setEntry: { reps: number; weight: number } | undefined = setMap.get(sn);
             const today: { reps: number; weight: number } = setEntry ?? { reps: tSet.reps, weight: tSet.weight };
 
-            // Set number
+            // Set number (always first, not reorderable)
             tr.createEl("td", {
                 text: String(sn),
                 cls: "gym-cell-set-num",
             });
 
-            // rep templ. (read-only)
-            tr.createEl("td", {
-                text: String(tSet.reps),
-                cls: "gym-cell-template",
-            });
+            for (const colId of order) {
+                this.renderCell(tr, colId, tplEx, tSet, sn, today, last);
+            }
+        }
+    }
 
-            // rep last t. (read-only)
-            tr.createEl("td", {
-                text: last ? String(last.reps) : "-",
-                cls: "gym-cell-last",
-            });
-
-            // rep today (editable)
-            const repTd = tr.createEl("td", "gym-cell-today");
-            const repInput = repTd.createEl("input", {
-                cls: "gym-input-num",
-                attr: { type: "number", min: "0", max: "999" },
-            });
-            repInput.value = String(today.reps);
-            repInput.oninput = () => {
-                const current = this.todayData.get(tplEx.id)?.get(sn)
-                    ?? { reps: tSet.reps, weight: tSet.weight };
-                this.updateTodayData(tplEx.id, sn, Number(repInput.value), current.weight);
-            };
-
-            // kg templ. (read-only)
-            tr.createEl("td", {
-                text: String(tSet.weight),
-                cls: "gym-cell-template",
-            });
-
-            // kg last t. (read-only)
-            tr.createEl("td", {
-                text: last ? String(last.weight) : "-",
-                cls: "gym-cell-last",
-            });
-
-            // kg today (editable)
-            const kgTd = tr.createEl("td", "gym-cell-today");
-            const kgInput = kgTd.createEl("input", {
-                cls: "gym-input-num",
-                attr: { type: "number", min: "0", max: "9999", step: "0.5" },
-            });
-            kgInput.value = String(today.weight);
-            kgInput.oninput = () => {
-                const current = this.todayData.get(tplEx.id)?.get(sn)
-                    ?? { reps: tSet.reps, weight: tSet.weight };
-                this.updateTodayData(tplEx.id, sn, current.reps, Number(kgInput.value));
-            };
-
-            // rest (read-only)
-            tr.createEl("td", {
-                text: this.formatRest(tSet.restSeconds),
-                cls: "gym-cell-template",
-            });
+    /** Renders a single data cell for the given column id, in the current
+     *  row. "reps" and "kg" render editable inputs bound to today's data;
+     *  all other columns render read-only reference values. */
+    private renderCell(
+        tr: HTMLElement,
+        colId: WorkoutColumnId,
+        tplEx: TemplateExercise,
+        tSet: TemplateSet,
+        sn: number,
+        today: { reps: number; weight: number },
+        last: { reps: number; weight: number } | undefined
+    ): void {
+        switch (colId) {
+            case 'reps': {
+                const repTd = tr.createEl("td", "gym-cell-today");
+                const repInput = repTd.createEl("input", {
+                    cls: "gym-input-num",
+                    attr: { type: "number", min: "0", max: "999" },
+                });
+                repInput.value = String(today.reps);
+                repInput.oninput = () => {
+                    const current = this.todayData.get(tplEx.id)?.get(sn)
+                        ?? { reps: tSet.reps, weight: tSet.weight };
+                    this.updateTodayData(tplEx.id, sn, Number(repInput.value), current.weight);
+                };
+                break;
+            }
+            case 'kg': {
+                const kgTd = tr.createEl("td", "gym-cell-today");
+                const kgInput = kgTd.createEl("input", {
+                    cls: "gym-input-num",
+                    attr: { type: "number", min: "0", max: "9999", step: "0.5" },
+                });
+                kgInput.value = String(today.weight);
+                kgInput.oninput = () => {
+                    const current = this.todayData.get(tplEx.id)?.get(sn)
+                        ?? { reps: tSet.reps, weight: tSet.weight };
+                    this.updateTodayData(tplEx.id, sn, current.reps, Number(kgInput.value));
+                };
+                break;
+            }
+            case 'reps_last':
+                tr.createEl("td", {
+                    text: last ? String(last.reps) : "-",
+                    cls: "gym-cell-last",
+                });
+                break;
+            case 'kg_last':
+                tr.createEl("td", {
+                    text: last ? String(last.weight) : "-",
+                    cls: "gym-cell-last",
+                });
+                break;
+            case 'reps_tpl':
+                tr.createEl("td", {
+                    text: String(tSet.reps),
+                    cls: "gym-cell-template",
+                });
+                break;
+            case 'kg_tpl':
+                tr.createEl("td", {
+                    text: String(tSet.weight),
+                    cls: "gym-cell-template",
+                });
+                break;
+            case 'rest':
+                tr.createEl("td", {
+                    text: this.formatRest(tSet.restSeconds),
+                    cls: "gym-cell-template",
+                });
+                break;
         }
     }
 

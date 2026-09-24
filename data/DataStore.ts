@@ -1,4 +1,4 @@
-import { GymTrackerData, GymSettings, WorkoutTemplate, WorkoutSession, LastSetData } from "../types";
+import { GymTrackerData, GymSettings, WorkoutTemplate, WorkoutSession, LastSetData, WorkoutColumnId, DEFAULT_WORKOUT_COLUMN_ORDER } from "../types";
 import { Plugin, normalizePath, Notice } from "obsidian";
 
 const DEFAULT_SETTINGS: GymSettings = {
@@ -7,6 +7,7 @@ const DEFAULT_SETTINGS: GymSettings = {
     vaultFolder: '.gym-tracker',
     vaultFileName: 'data',
     showInGraph: false,
+    columnOrder: [...DEFAULT_WORKOUT_COLUMN_ORDER],
 };
 
 const KG_TO_LBS = 2.20462;
@@ -46,7 +47,7 @@ export class DataStore {
                 Object.assign(bootSettings, this.buildSettings(raw.settings));
             }
         }
-        
+
         const templatesPath = this.getTemplatesVaultPath(bootSettings);
         if (await this.plugin.app.vault.adapter.exists(templatesPath)) {
             const text = await this.plugin.app.vault.adapter.read(templatesPath);
@@ -86,7 +87,41 @@ export class DataStore {
             s.vaultFileName = fileName.replace(/\.(json|md)$/, '');
             s.showInGraph = legacyVaultPath.endsWith('.md');
         }
+        // Ensure columnOrder is always a complete, valid list — guards
+        // against settings saved before this option existed, or a corrupted/
+        // truncated array from manual editing or a future plugin version
+        // removing/renaming a column id.
+        s.columnOrder = this.sanitizeColumnOrder(saved?.columnOrder);
         return s;
+    }
+
+    /** Returns a column order containing exactly the known column ids: any
+     *  recognized ids from `saved` are kept in their given order, and any
+     *  missing ids are appended in their default order. Falls back entirely
+     *  to the default order if `saved` isn't a usable array. */
+    private sanitizeColumnOrder(saved: unknown): WorkoutColumnId[] {
+        if (!Array.isArray(saved)) {
+            return [...DEFAULT_WORKOUT_COLUMN_ORDER];
+        }
+
+        const known = new Set<string>(DEFAULT_WORKOUT_COLUMN_ORDER);
+        const seen = new Set<WorkoutColumnId>();
+        const result: WorkoutColumnId[] = [];
+
+        for (const id of saved) {
+            if (typeof id === 'string' && known.has(id) && !seen.has(id as WorkoutColumnId)) {
+                seen.add(id as WorkoutColumnId);
+                result.push(id as WorkoutColumnId);
+            }
+        }
+
+        for (const id of DEFAULT_WORKOUT_COLUMN_ORDER) {
+            if (!seen.has(id)) {
+                result.push(id);
+            }
+        }
+
+        return result;
     }
 
     async save(): Promise<void> {
@@ -295,6 +330,8 @@ export class DataStore {
         if (oldUnit !== newUnit) {
             this.convertWeights(oldUnit, newUnit);
         }
+
+        settings.columnOrder = this.sanitizeColumnOrder(settings.columnOrder);
 
         this.data.settings = settings;
         await this.save();

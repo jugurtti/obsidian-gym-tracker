@@ -52,6 +52,36 @@ export interface WorkoutSession {
     completedAt: string;    // ISO timestamp
 }
 
+// ── Workout table columns ──
+
+/** Identifies a reorderable data column in the workout view's set table.
+ *  "Set" is not included here — it is always rendered first and is not
+ *  reorderable. */
+export type WorkoutColumnId =
+    | 'reps'
+    | 'kg'
+    | 'reps_last'
+    | 'kg_last'
+    | 'reps_tpl'
+    | 'kg_tpl'
+    | 'rest';
+
+/** Default column order — matches the plugin's original, unconfigurable
+ *  column layout exactly, so installing this feature does not change the
+ *  workout table for any existing user. Users who prefer the editable
+ *  ("today") columns first (to avoid horizontal scrolling on mobile) can
+ *  rearrange this via Settings → Gym Workout Tracker → Workout Table
+ *  Columns. */
+export const DEFAULT_WORKOUT_COLUMN_ORDER: WorkoutColumnId[] = [
+    'reps_tpl',
+    'reps_last',
+    'reps',
+    'kg_tpl',
+    'kg_last',
+    'kg',
+    'rest',
+];
+
 // ── Plugin settings ──
 
 export interface GymSettings {
@@ -60,6 +90,7 @@ export interface GymSettings {
     vaultFolder: string;        // e.g. ".gym-tracker" to hide, "gym-tracker" to show
     vaultFileName: string;      // e.g. "data" (no extension)
     showInGraph: boolean;       // true = .md frontmatter, false = .json
+    columnOrder: WorkoutColumnId[]; // user-customizable workout table column order
 }
 
 // ── Plugin data root ──
